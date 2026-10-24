@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 1 课 · 三层配置与一次绑定</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/course.js"></script>
+<script defer src="../assets/quiz.js"></script>
+</head>
+<body>
+<main class="page">
+
+<header>
+  <p class="kicker">RK3568 内核设计课 · 第 1 课 · 30 分钟</p>
+  <h1>三层配置，<br>一块网卡怎样被内核认领</h1>
+  <p class="lede"><code>alientek_rk3568_defconfig</code> 只有 20 行，没有一行 <code>CONFIG_</code>；<code>rk3568-atk-custom.dts</code> 里却写着网卡的地址、时钟和引脚。中间发生了什么，才让一块网卡在板上真正活起来？</p>
+  <p class="meta">难度 ★★☆☆☆ · 导航课　|　需要板子与串口　|　<a href="../reference/glossary.html">词汇表</a> · <a href="../reference/kernel-map.html">源码地图</a></p>
+  <p class="meta roadmap">课程主线　① 配置与绑定 <strong>← 本课</strong>　② 启动　③ 内存　④ 调度　⑤ 中断　⑥ 驱动模型　⑦ 调试</p>
+</header>
+
+<section class="win">
+  <h2>本课胜利条件</h2>
+  <p>在板上任意挑一个设备，3 分钟内说出它的 <strong>DTS 节点</strong>、<strong>驱动文件</strong>、<strong>Kconfig 开关</strong>和 <strong>sysfs 路径</strong>。</p>
+</section>
+
+<h2>先建立一张地图</h2>
+
+<p>内核不是“一份配置编出一块板”。从源码到板上运行，要经过三层，每层只回答一个问题：</p>
+
+<div class="stack">
+  <div class="layer hot">
+    <div class="layer-num">01</div>
+    <div>
+      <b>板级清单 · SDK 层</b>
+      <span>回答“构建哪块板”。选择设备树、配置 fragment、U-Boot 与根文件系统。</span>
+      <span><code>device/rockchip/.chips/rk3566_rk3568/alientek_rk3568_defconfig</code></span>
+    </div>
+  </div>
+  <div class="arrow">↓ 把选择交给构建系统</div>
+  <div class="layer">
+    <div class="layer-num">02</div>
+    <div>
+      <b>内核配置 · 代码层</b>
+      <span>回答“编进哪些代码”。Kconfig 声明规则，<code>.config</code> 记录结果，Makefile 决定编译哪些目标。</span>
+      <span><code>kernel/.config</code> → <code>include/generated/autoconf.h</code> → <code>vmlinux</code></span>
+    </div>
+  </div>
+  <div class="arrow">↓ 与 DTB 一起决定运行时</div>
+  <div class="layer">
+    <div class="layer-num">03</div>
+    <div>
+      <b>硬件描述 · 设备树层</b>
+      <span>回答“运行哪些设备”。地址、中断、时钟、引脚，以及最重要的：启用还是禁用。</span>
+      <span><code>arch/arm64/boot/dts/rockchip/rk3568.dtsi</code> + 板级 <code>.dts</code> → <code>.dtb</code></span>
+    </div>
+  </div>
+  <div class="arrow">↓ compatible 匹配 → 驱动 probe</div>
+</div>
+
+<p>把这句话记住：<strong>内核镜像决定“有哪些代码”，设备树决定“这些代码为谁工作”。</strong> 同一份 <code>vmlinux</code> 可以服务外设不同的多块板子，因为板级差异留在 DTS 里，不必改 C 代码。驱动和设备则通过 <code>compatible</code> 这个“合同”相遇。这正是 Linux 一套源码能支撑海量板卡的结构性原因。</p>
+
+<h2>跟着 GMAC0 走一遍</h2>
+
+<h3>① 板级清单只做选择，不描述硬件</h3>
+
+<pre><code><span class="c"># device/rockchip/.chips/rk3566_rk3568/alientek_rk3568_defconfig</span>
+RK_KERNEL_DTS_NAME="rk3568-atk-custom"          <span class="c"># :4  用哪份设备树</span>
+RK_USE_FIT_IMG=y                                 <span class="c"># :7  打包成 FIT 镜像</span>
+RK_KERNEL_CFG_FRAGMENTS="rk3568_atk_net.config"  <span class="c"># :18 叠加哪些配置差异</span></code></pre>
+<p class="fileref"><a href="../../device/rockchip/.chips/rk3566_rk3568/alientek_rk3568_defconfig">device/rockchip/.chips/rk3566_rk3568/alientek_rk3568_defconfig</a></p>
+
+<p>这 20 行里一个 <code>CONFIG_</code> 都没有。它不描述硬件，只记录“这块板怎么构建”。SDK 的 <code>mk-kernel.sh</code> 会把基础配置、fragment 和 DTS 名一起传给内核构建：</p>
+
+<p class="fileref"><a href="../../device/rockchip/common/scripts/mk-kernel.sh">device/rockchip/common/scripts/mk-kernel.sh:63</a></p>
+
+<p>基础配置由 SDK 的 <code>RK_KERNEL_CFG</code> 提供（<code>device/rockchip/common/configs/Config.in.kernel:5</code>，未覆盖时默认 <code>rockchip_linux_defconfig</code>）。板级 defconfig 的职责，是在这个基线上记录<strong>差异</strong>。</p>
+
+<h3>② fragment 是差异，Kconfig 才是规则</h3>
+
+<pre><code><span class="c"># kernel/arch/arm64/configs/rk3568_atk_net.config</span>
+CONFIG_NET_VENDOR_STMICRO=y   <span class="c"># drivers/net/ethernet/stmicro</span>
+CONFIG_STMMAC_ETH=y          <span class="c"># 通用 DWMAC 核心</span>
+CONFIG_PHYLIB=y              <span class="c"># PHY 抽象层</span></code></pre>
+<p class="fileref"><a href="../../kernel/arch/arm64/configs/rk3568_atk_net.config">kernel/arch/arm64/configs/rk3568_atk_net.config</a></p>
+
+<p>这些不是随手写的开关。每个选项的行为由 Kconfig 声明。看 Rockchip 胶水层的定义：</p>
+
+<pre><code><span class="c"># drivers/net/ethernet/stmicro/stmmac/Kconfig:150</span>
+<span class="k">config</span> DWMAC_ROCKCHIP
+        <span class="k">tristate</span> "Rockchip dwmac support"
+        <span class="k">default</span> ARCH_ROCKCHIP
+        <span class="k">depends on</span> OF &amp;&amp; (ARCH_ROCKCHIP || COMPILE_TEST)
+        <span class="k">select</span> MFD_SYSCON</code></pre>
+<p class="fileref"><a href="../../kernel/drivers/net/ethernet/stmicro/stmmac/Kconfig">kernel/drivers/net/ethernet/stmicro/stmmac/Kconfig:150</a></p>
+
+<p>三行依赖值得逐个读：<code>default ARCH_ROCKCHIP</code> 让 RK3568 默认打开它；<code>depends on OF</code> 说明没有设备树就没有这个驱动；<code>select MFD_SYSCON</code> 自动带上寄存器访问的依赖。<strong>Kconfig 不只是开关面板，它是一张依赖图。</strong></p>
+
+<p>这个选择最终落到四个位置，可以逐级验证：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>阶段</th><th>证据</th></tr></thead>
+<tbody>
+<tr><td>配置结果</td><td><code>kernel/.config:1265</code> → <code>CONFIG_DWMAC_ROCKCHIP=y</code></td></tr>
+<tr><td>C 代码可见</td><td><code>include/generated/autoconf.h:1197</code> → <code>#define CONFIG_DWMAC_ROCKCHIP 1</code></td></tr>
+<tr><td>编译规则</td><td><code>.../stmmac/Makefile:27</code> → <code>obj-$(CONFIG_DWMAC_ROCKCHIP) += dwmac-rockchip.o</code></td></tr>
+<tr><td>目标文件</td><td><code>drivers/net/ethernet/stmicro/stmmac/dwmac-rk.o</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout warn">
+<span class="callout-title">注意：磁盘上的 .config 不是运行内核的事实</span>
+<p>本仓库里 <code>kernel/.config</code> 的修改时间（10-08）比 <code>autoconf.h</code>、<code>vmlinux</code>（09-21）都新；而且 <code>MFD_RK808</code> 在 <code>.config:2023</code> 是 <em>not set</em>，在 <code>autoconf.h:501</code> 却是 <code>1</code>。<strong>磁盘配置与当前镜像不同步。</strong> 如果直接拿这份 <code>.config</code> 编译，PMIC 驱动不会进去；而 SDK 脚本通常会用 defconfig + fragment 重新生成配置，结果又可能不同。判断运行内核带什么，永远看板上的 <code>zcat /proc/config.gz</code>；重编前，先确认 <code>.config</code> 是怎么来的。</p>
+</div>
+
+<h3>③ SoC dtsi 给能力，板级 DTS 给策略</h3>
+
+<pre><code><span class="c">/* arch/arm64/boot/dts/rockchip/rk3568.dtsi:2584 */</span>
+gmac0: ethernet@fe2a0000 {
+        compatible = "rockchip,rk3568-gmac", "snps,dwmac-4.20a";
+        reg = &lt;0x0 0xfe2a0000 0x0 0x10000&gt;;
+        interrupts = &lt;GIC_SPI 27 IRQ_TYPE_LEVEL_HIGH&gt;, ...;
+        status = "disabled";          <span class="c">/* :2610 默认不启用 */</span>
+};</code></pre>
+<p class="fileref"><a href="../../kernel/arch/arm64/boot/dts/rockchip/rk3568.dtsi">kernel/arch/arm64/boot/dts/rockchip/rk3568.dtsi:2584</a></p>
+
+<pre><code><span class="c">/* arch/arm64/boot/dts/rockchip/rk3568-atk-custom.dts:442 */</span>
+&amp;gmac0 {
+        phy-mode = "rgmii";
+        clock_in_out = "output";
+        snps,reset-gpio = &lt;&amp;gpio2 RK_PD3 GPIO_ACTIVE_LOW&gt;;
+        ...
+        phy-handle = &lt;&amp;rgmii_phy0&gt;;
+        status = "okay";              <span class="c">/* :467 这块板启用它 */</span>
+};</code></pre>
+<p class="fileref"><a href="../../kernel/arch/arm64/boot/dts/rockchip/rk3568-atk-custom.dts">kernel/arch/arm64/boot/dts/rockchip/rk3568-atk-custom.dts:442</a></p>
+
+<p>SoC 的 dtsi 描述“这颗芯片具备什么”，所以 <code>status</code> 默认是 <code>disabled</code>；板级 DTS 用标签 <code>&amp;gmac0</code> 覆盖，只写“这块板接了什么、启用什么”。<code>compatible</code>、<code>reg</code>、<code>interrupts</code> 全部继承，不重复。这是<strong>能力与策略分离</strong>：一颗 SoC 的 dtsi 服务所有板子，板级文件只记录差异。</p>
+
+<p>顺带记住两个数字：<code>reg</code> 的 <code>0xfe2a0000</code> 会变成 platform 设备名 <code>fe2a0000.ethernet</code>；<code>interrupts</code> 的 27 是 GIC 的 SPI 27 号中断。</p>
+
+<h3>④ compatible 是合同，probe 是握手</h3>
+
+<pre><code><span class="c">/* drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c */</span>
+<span class="k">static const struct</span> of_device_id rk_gmac_dwmac_match[] = {   <span class="c">/* :2858 */</span>
+        ...
+        { .compatible = "rockchip,rk3568-gmac", .data = &amp;rk3568_ops },  <span class="c">/* :2896 */</span>
+        { }
+};
+
+<span class="k">static struct</span> platform_driver rk_gmac_dwmac_driver = {        <span class="c">/* :2914 */</span>
+        .probe  = rk_gmac_probe,                              <span class="c">/* :2755 */</span>
+        .driver = {
+                .name           = "rk_gmac-dwmac",
+                .of_match_table = rk_gmac_dwmac_match,
+        },
+};
+module_platform_driver(rk_gmac_dwmac_driver);</code></pre>
+<p class="fileref"><a href="../../kernel/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c">kernel/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c:2858</a></p>
+
+<p>设备树被加载后，OF 核心把节点变成 <code>platform_device</code>；platform 总线拿设备侧的 <code>compatible</code> 列表，逐项比对驱动侧的 <code>of_match_table</code>；匹配成功后，driver core 调用 <code>probe</code>。这就是“被认领”的全过程。</p>
+
+<p><code>rk_gmac_probe</code> 先解析 DTS（时钟、复位脚、PHY 模式），上电，然后在 <code>:2798</code> 调用 <code>stmmac_dvr_probe()</code>，把后续工作交给 Synopsys DWMAC 的通用核心（<code>stmmac_main.c</code>）。</p>
+
+<div class="callout accent">
+<span class="callout-title">设计洞察 · 两层驱动</span>
+<p>Rockchip 的 <code>dwmac-rk.c</code> 是 <strong>glue 层</strong>，只处理这家 SoC 特有的时钟、GRF、电源；Synopsys 的 <code>stmmac</code> 是 <strong>core 层</strong>，处理通用 MAC 逻辑。<code>compatible</code> 的两个字符串正好对应这两层：<code>rockchip,rk3568-gmac</code> 选 glue，<code>snps,dwmac-4.20a</code> 描述 IP 版本。面试里可以这样说：“BSP 的差异通常在 glue 层，通用逻辑来自上游 core；定位问题先判断该改哪一层。”</p>
+</div>
+
+<h2>板上验证（5 分钟）</h2>
+
+<p>串口登录板子，逐条执行。每一条都对应上面的一层：</p>
+
+<ul class="checklist">
+  <li>
+    <input type="checkbox" id="c1" data-key="l1-c1">
+    <label for="c1"><code>ls /sys/bus/platform/devices/ | grep fe2a0000</code><br><span class="small">预期：<code>fe2a0000.ethernet</code>。设备已由 DTB 创建。</span></label>
+  </li>
+  <li>
+    <input type="checkbox" id="c2" data-key="l1-c2">
+    <label for="c2"><code>readlink -f /sys/bus/platform/devices/fe2a0000.ethernet/driver</code><br><span class="small">预期：<code>/sys/bus/platform/drivers/rk_gmac-dwmac</code>。这就是“被认领”的证据。</span></label>
+  </li>
+  <li>
+    <input type="checkbox" id="c3" data-key="l1-c3">
+    <label for="c3"><code>ls /sys/bus/platform/drivers/rk_gmac-dwmac/</code><br><span class="small">预期看到 <code>bind</code>、<code>fe2a0000.ethernet</code>、<code>uevent</code>、<code>unbind</code>。</span></label>
+  </li>
+  <li>
+    <input type="checkbox" id="c4" data-key="l1-c4">
+    <label for="c4"><code>zcat /proc/config.gz | grep -E "CONFIG_(STMMAC_ETH|DWMAC_ROCKCHIP)="</code><br><span class="small">预期两行都是 <code>=y</code>。这是<strong>运行内核</strong>的配置，不是磁盘上的 <code>.config</code>。</span></label>
+  </li>
+  <li>
+    <input type="checkbox" id="c5" data-key="l1-c5">
+    <label for="c5"><code>tr '\0' '\n' &lt; /proc/device-tree/ethernet@fe2a0000/compatible</code><br><span class="small">预期两行：<code>rockchip,rk3568-gmac</code> 与 <code>snps,dwmac-4.20a</code>。这是内核实际拿到的 DTB。</span></label>
+  </li>
+  <li>
+    <input type="checkbox" id="c6" data-key="l1-c6">
+    <label for="c6"><code>dmesg | grep -i "rk_gmac-dwmac" | head</code><br><span class="small">预期看到以 <code>rk_gmac-dwmac fe2a0000.ethernet:</code> 开头的 probe 日志。</span></label>
+  </li>
+</ul>
+
+<div class="callout">
+<span class="callout-title">如果对不上：按三层排查</span>
+<ul style="margin-bottom:0">
+  <li><strong>连节点都没有</strong> → DTB 没更新，或 <code>status</code> 还是 <code>disabled</code>；对照板上 <code>/proc/device-tree</code>。</li>
+  <li><strong>有节点、没有 driver 链接</strong> → 驱动没编进内核（查 <code>/proc/config.gz</code>），或 <code>compatible</code> 不匹配。</li>
+  <li><strong>有 driver 链接、没有 eth0</strong> → probe 失败；看 <code>dmesg</code> 末尾的错误码，再回源码对应行。</li>
+</ul>
+</div>
+
+<h2>迁移练习：换一条总线（课后 5 分钟）</h2>
+
+<p>GMAC 在 platform 总线；板上的 RK809 电源管理芯片在 I2C 总线。模型完全一样，只是总线和驱动结构换了名字。先找到它：</p>
+
+<pre><code><span class="c"># 找到 rk809 的 i2c 设备目录（编号取决于 probe 顺序）</span>
+grep -l rk809 /sys/bus/i2c/devices/*/name
+
+<span class="c"># 看它有没有被驱动认领</span>
+readlink -f /sys/bus/i2c/devices/&lt;上一步的目录&gt;/driver
+
+<span class="c"># 运行内核到底带不带这个驱动</span>
+zcat /proc/config.gz | grep MFD_RK808</code></pre>
+
+<p>然后回答三个问题（先自己答，再展开）：</p>
+<ol>
+  <li>设备名为什么是 <code>N-0020</code>，而不是像 GMAC 那样的 MMIO 地址？</li>
+  <li>驱动用什么结构注册？匹配表在源码哪一行？</li>
+  <li>运行内核的 <code>CONFIG_MFD_RK808</code> 是什么值？和磁盘 <code>.config</code> 一致吗？</li>
+</ol>
+
+<details>
+<summary>对照答案</summary>
+<p><strong>1.</strong> I2C client 由“总线编号 + 7 位地址”命名，<code>0x20</code> 就是 DTS 里的 <code>reg</code>；platform 设备没有自描述总线，所以用 MMIO 地址命名。<br>
+<strong>2.</strong> <code>struct i2c_driver rk808_i2c_driver</code>，见 <code>drivers/mfd/rk808.c:1509</code>；<code>.of_match_table = rk808_of_match</code>，表里含 <code>rockchip,rk809</code>。DTS 节点在板级文件的 <code>:105</code>。<br>
+<strong>3.</strong> 以板上输出为准。如果 <code>/proc/config.gz</code> 是 <code>=y</code> 而磁盘 <code>.config</code> 是 <em>not set</em>，说明磁盘配置不是当前镜像的事实——这正是本课要你养成的区分习惯。</p>
+</details>
+
+<h2>小测：把模型压实</h2>
+
+<div class="quiz" data-quiz>
+  <div class="quiz-head">
+    <h2>5 题 · 即时反馈</h2>
+    <span class="quiz-score"></span>
+  </div>
+
+  <div class="q">
+    <p class="q-text">1. 同一份 vmlinux 要服务两块外设不同的板子，主要靠哪一层区分？</p>
+    <button class="opt" data-correct="false" data-why="它决定编进哪些代码，但两块板可以共用同一份配置。">编译配置（.config）层</button>
+    <button class="opt" data-correct="false" data-why="它决定构建哪块板，但换板通常只是换 DTS 与 fragment。">板级清单（defconfig）层</button>
+    <button class="opt" data-correct="true" data-why="DTS 在运行时告诉内核这块板有哪些设备、资源在哪、哪些启用，同一镜像因此能适配不同板。">硬件描述（DTS）层</button>
+    <button class="opt" data-correct="false" data-why="U-Boot 负责加载与传参，不参与设备与驱动的匹配。">引导环境（U-Boot）层</button>
+    <p class="feedback" aria-live="polite"></p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">2. <code>CONFIG_DWMAC_ROCKCHIP=y</code> 最终被写进哪个文件，供 C 代码使用？</p>
+    <button class="opt" data-correct="true" data-why="Kconfig 系统把 .config 转成宏定义，C 代码里的 #ifdef CONFIG_* 才生效。"><code>include/generated/autoconf.h</code></button>
+    <button class="opt" data-correct="false" data-why=".config 在 kernel 根目录，是 make 的输入，不是 C 头文件。"><code>arch/arm64/configs/.config</code></button>
+    <button class="opt" data-correct="false" data-why="Kconfig 只声明选项与依赖，不生成具体宏值。"><code>drivers/net/.../Kconfig</code></button>
+    <button class="opt" data-correct="false" data-why="它提供 IS_ENABLED 等辅助宏，不存放具体配置值。"><code>include/linux/kconfig.h</code></button>
+    <p class="feedback" aria-live="polite"></p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">3. platform 驱动在与设备树匹配时，使用哪个结构里的表？</p>
+    <button class="opt" data-correct="false" data-why="bus_type 提供 match 回调，但具体的 compatible 表不在它里面。"><code>struct bus_type</code></button>
+    <button class="opt" data-correct="false" data-why="device_node 是设备侧的数据，不含驱动支持列表。"><code>struct device_node</code></button>
+    <button class="opt" data-correct="false" data-why="platform_device 描述设备，匹配表在驱动侧。"><code>struct platform_device</code></button>
+    <button class="opt" data-correct="true" data-why="驱动的 of_match_table 指向 of_device_id 数组，总线据此比较 compatible。"><code>struct of_device_id</code></button>
+    <p class="feedback" aria-live="polite"></p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">4. defconfig 里的 <code>RK_KERNEL_DTS_NAME</code> 的作用是？</p>
+    <button class="opt" data-correct="false" data-why="驱动由内核 CONFIG_ 决定，不由这个变量决定。">指定本次构建启用的驱动</button>
+    <button class="opt" data-correct="true" data-why="SDK 把它传给构建系统，决定编哪份 DTS 成 DTB。">指定本次构建的设备树名称</button>
+    <button class="opt" data-correct="false" data-why="根文件系统由 RK_BUILDROOT_BASE_CFG 等变量选择。">指定构建所用的根文件系统</button>
+    <button class="opt" data-correct="false" data-why="工具链由 SDK 按架构自动选择，与 DTS 名无关。">指定构建所用的交叉编译器</button>
+    <p class="feedback" aria-live="polite"></p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">5. 驱动 <code>probe</code> 被调用的直接触发点是？</p>
+    <button class="opt" data-correct="false" data-why="解压只是启动早期一步，离驱动绑定还很远。">内核解压 vmlinux 镜像之后</button>
+    <button class="opt" data-correct="false" data-why="probe 与根文件系统没有固定先后，很多驱动在 init 前已 probe。">根文件系统挂载完成之后</button>
+    <button class="opt" data-correct="true" data-why="driver core 在总线 match 成功后调用 probe，这是绑定关系的建立点。">总线匹配 device 与 driver 后</button>
+    <button class="opt" data-correct="false" data-why="那只提供设备数据，还要等内核解析并匹配驱动。">U-Boot 加载 DTB 到内存之后</button>
+    <p class="feedback" aria-live="polite"></p>
+  </div>
+
+  <button class="quiz-reset" type="button">重新作答</button>
+</div>
+
+<h2>读一手资料 + 60 秒复述</h2>
+
+<div class="source-box">
+  <h2>主源 · 10 分钟</h2>
+  <p><strong><code>kernel/Documentation/driver-api/driver-model/binding.rst</code></strong> —— 内核自带的驱动绑定说明，短、权威，正好覆盖本课的 bus/device/driver 与 match 语义。<br>
+  <a href="../../kernel/Documentation/driver-api/driver-model/binding.rst">本地打开</a> · <a href="https://docs.kernel.org/driver-api/driver-model/binding.html">上游同名文档</a></p>
+  <p class="small">延伸：同目录的 <code>platform.rst</code>（platform 总线）与 <code>kernel/Documentation/devicetree/bindings/net/rockchip-dwmac.yaml</code>（GMAC 属性约定）。</p>
+</div>
+
+<p>合上本页，用 60 秒复述这条链。能在白板上写出这五步，本课就过关了：</p>
+
+<ol>
+  <li>板级 defconfig 选择 DTS 与 fragment；</li>
+  <li>Kconfig 把选择变成 <code>.config</code> 和 <code>autoconf.h</code>，Makefile 决定编哪些 <code>.o</code>；</li>
+  <li>DTS 描述设备与资源，<code>status</code> 决定启用；</li>
+  <li>总线用 <code>compatible</code> 匹配 <code>of_device_id</code>；</li>
+  <li>driver core 调 <code>probe</code>，glue 层接上通用 core。</li>
+</ol>
+
+<div class="ask">
+  <strong>卡住了就回来问。</strong> 尤其是板上输出和预期不一致时，把 <code>dmesg</code> 最后 20 行贴给我，我们一起按三层排查。下一课：U-Boot 交棒之后，内核怎样走到 <code>start_kernel</code>。
+</div>
+
+<footer class="nav-foot">
+  <a href="../reference/kernel-map.html">← 源码地图</a>
+  <span class="next">第 2 课 · 启动流程（待生成）</span>
+</footer>
+
+</main>
+</body>
+</html>
